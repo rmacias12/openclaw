@@ -36,15 +36,15 @@ export function createTelegramRunnerOptions(cfg: OpenClawConfig): RunOptions<unk
     },
     runner: {
       fetch: {
-        // Match grammY defaults
+        // Enforce 30-second timeout more strictly
         timeout: 30,
         // Request reactions without dropping default update types.
         allowed_updates: resolveTelegramAllowedUpdates(),
       },
       // Suppress grammY getUpdates stack traces; we log concise errors ourselves.
       silent: true,
-      // Retry transient failures for a limited window before surfacing errors.
-      maxRetryTime: 5 * 60 * 1000,
+      // Reduce retry time to prevent long hangs before our own retry logic takes over
+      maxRetryTime: 2 * 60 * 1000, // 2 minutes instead of 5
       retryInterval: "exponential",
     },
   };
@@ -56,6 +56,8 @@ const TELEGRAM_POLL_RESTART_POLICY = {
   factor: 1.8,
   jitter: 0.25,
 };
+
+const MAX_RESTART_ATTEMPTS = 20; // Prevent infinite retry loops
 
 const isGetUpdatesConflict = (err: unknown) => {
   if (!err || typeof err !== "object") {
@@ -85,6 +87,43 @@ const isGrammyHttpError = (err: unknown): boolean => {
     return false;
   }
   return (err as { name?: string }).name === "HttpError";
+};
+
+const isTimeoutAbortError = (err: unknown): boolean => {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+
+  // Walk the error cause chain looking for timeout-specific indicators
+  let current: any = err;
+  while (current) {
+    const code = current.code;
+    const name = current.name;
+    const message = current.message ? String(current.message).toLowerCase() : "";
+
+    // Check for timeout-specific error codes from undici/Node.js
+    if (
+      code === "ETIMEDOUT" ||
+      code === "ESOCKETTIMEDOUT" ||
+      code === "UND_ERR_HEADERS_TIMEOUT" ||
+      code === "UND_ERR_BODY_TIMEOUT"
+    ) {
+      return true;
+    }
+
+    // Check for TimeoutError name (common in undici/AbortSignal chains)
+    if (name === "TimeoutError") {
+      return true;
+    }
+
+    // Fall back to message heuristic if code/name don't match
+    if (message.includes("timeout") || message.includes("timed out")) {
+      return true;
+    }
+
+    current = current.cause;
+  }
+  return false;
 };
 
 export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
@@ -182,21 +221,53 @@ export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
         await runner.task();
         return;
       } catch (err) {
-        if (opts.abortSignal?.aborted) {
+        // Check if we're actually being aborted vs. a timeout/network error
+        const isActualAbort = opts.abortSignal?.aborted === true;
+
+        if (isActualAbort) {
+          // Let callers' .catch() handler see the error during shutdown
           throw err;
         }
+
         const isConflict = isGetUpdatesConflict(err);
         const isRecoverable = isRecoverableTelegramNetworkError(err, { context: "polling" });
-        if (!isConflict && !isRecoverable) {
+        const isTimeout = isTimeoutAbortError(err);
+
+        // Treat timeout AbortErrors as recoverable network errors
+        const shouldRetry = isConflict || isRecoverable || isTimeout;
+
+        if (!shouldRetry) {
           throw err;
         }
+
+        // Prevent infinite retry loops
+        if (restartAttempts >= MAX_RESTART_ATTEMPTS) {
+          const errMsg = formatErrorMessage(err);
+          (opts.runtime?.error ?? console.error)(
+            `Telegram monitor: maximum restart attempts (${MAX_RESTART_ATTEMPTS}) exceeded: ${errMsg}`,
+          );
+          throw err;
+        }
+
         restartAttempts += 1;
-        const delayMs = computeBackoff(TELEGRAM_POLL_RESTART_POLICY, restartAttempts);
-        const reason = isConflict ? "getUpdates conflict" : "network error";
+
+        let reason = "network error";
+        if (isConflict) reason = "getUpdates conflict";
+        else if (isTimeout) reason = "request timeout";
+
         const errMsg = formatErrorMessage(err);
+        const delayMs = computeBackoff(TELEGRAM_POLL_RESTART_POLICY, restartAttempts);
         (opts.runtime?.error ?? console.error)(
-          `Telegram ${reason}: ${errMsg}; retrying in ${formatDurationPrecise(delayMs)}.`,
+          `Telegram ${reason}: ${errMsg}; retrying in ${formatDurationPrecise(delayMs)} (attempt ${restartAttempts}/${MAX_RESTART_ATTEMPTS}).`,
         );
+
+        // Stop the current runner before retrying
+        try {
+          await runner.stop();
+        } catch {
+          // Ignore runner stop errors
+        }
+
         try {
           await sleepWithAbort(delayMs, opts.abortSignal);
         } catch (sleepErr) {
