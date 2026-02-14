@@ -1,163 +1,61 @@
-import "./test-helpers.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  createWebInboundDeliverySpies,
+  createWebListenerFactoryCapture,
+  installWebAutoReplyTestHomeHooks,
+  installWebAutoReplyUnitTestHooks,
+  resetLoadConfigMock,
+  rmDirWithRetries,
+  sendWebGroupInboundMessage,
+  setLoadConfigMock,
+} from "./auto-reply.test-harness.js";
 
-vi.mock("../agents/pi-embedded.js", () => ({
-  abortEmbeddedPiRun: vi.fn().mockReturnValue(false),
-  isEmbeddedPiRunActive: vi.fn().mockReturnValue(false),
-  isEmbeddedPiRunStreaming: vi.fn().mockReturnValue(false),
-  runEmbeddedPiAgent: vi.fn(),
-  queueEmbeddedPiMessage: vi.fn().mockReturnValue(false),
-  resolveEmbeddedSessionLane: (key: string) => `session:${key.trim() || "main"}`,
-}));
+installWebAutoReplyTestHomeHooks();
 
-import { resetInboundDedupe } from "../auto-reply/reply/inbound-dedupe.js";
-import { resetLogger, setLoggerOverride } from "../logging.js";
-import { monitorWebChannel } from "./auto-reply.js";
-import { resetBaileysMocks, resetLoadConfigMock, setLoadConfigMock } from "./test-helpers.js";
+let monitorWebChannel: typeof import("./auto-reply.js").monitorWebChannel;
 
-let previousHome: string | undefined;
-let tempHome: string | undefined;
-
-const rmDirWithRetries = async (dir: string): Promise<void> => {
-  // Some tests can leave async session-store writes in-flight; recursive deletion can race and throw ENOTEMPTY.
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    try {
-      await fs.rm(dir, { recursive: true, force: true });
-      return;
-    } catch (err) {
-      const code =
-        err && typeof err === "object" && "code" in err
-          ? String((err as { code?: unknown }).code)
-          : null;
-      if (code === "ENOTEMPTY" || code === "EBUSY" || code === "EPERM") {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-        continue;
-      }
-      throw err;
-    }
-  }
-
-  await fs.rm(dir, { recursive: true, force: true });
-};
-
-beforeEach(async () => {
-  resetInboundDedupe();
-  previousHome = process.env.HOME;
-  tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-web-home-"));
-  process.env.HOME = tempHome;
+beforeAll(async () => {
+  ({ monitorWebChannel } = await import("./auto-reply.js"));
 });
-
-afterEach(async () => {
-  process.env.HOME = previousHome;
-  if (tempHome) {
-    await rmDirWithRetries(tempHome);
-    tempHome = undefined;
-  }
-});
-
-const _makeSessionStore = async (
-  entries: Record<string, unknown> = {},
-): Promise<{ storePath: string; cleanup: () => Promise<void> }> => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-session-"));
-  const storePath = path.join(dir, "sessions.json");
-  await fs.writeFile(storePath, JSON.stringify(entries));
-  const cleanup = async () => {
-    // Session store writes can be in-flight when the test finishes (e.g. updateLastRoute
-    // after a message flush). `fs.rm({ recursive })` can race and throw ENOTEMPTY.
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      try {
-        await fs.rm(dir, { recursive: true, force: true });
-        return;
-      } catch (err) {
-        const code =
-          err && typeof err === "object" && "code" in err
-            ? String((err as { code?: unknown }).code)
-            : null;
-        if (code === "ENOTEMPTY" || code === "EBUSY" || code === "EPERM") {
-          await new Promise((resolve) => setTimeout(resolve, 25));
-          continue;
-        }
-        throw err;
-      }
-    }
-
-    await fs.rm(dir, { recursive: true, force: true });
-  };
-  return {
-    storePath,
-    cleanup,
-  };
-};
 
 describe("web auto-reply", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    resetBaileysMocks();
-    resetLoadConfigMock();
-  });
-
-  afterEach(() => {
-    resetLogger();
-    setLoggerOverride(null);
-    vi.useRealTimers();
-  });
+  installWebAutoReplyUnitTestHooks();
 
   it("requires mention in group chats and injects history when replying", async () => {
-    const sendMedia = vi.fn();
-    const reply = vi.fn().mockResolvedValue(undefined);
-    const sendComposing = vi.fn();
+    const spies = createWebInboundDeliverySpies();
     const resolver = vi.fn().mockResolvedValue({ text: "ok" });
 
-    let capturedOnMessage:
-      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
-      | undefined;
-    const listenerFactory = async (opts: {
-      onMessage: (msg: import("./inbound.js").WebInboundMessage) => Promise<void>;
-    }) => {
-      capturedOnMessage = opts.onMessage;
-      return { close: vi.fn() };
-    };
+    const { listenerFactory, getOnMessage } = createWebListenerFactoryCapture();
 
     await monitorWebChannel(false, listenerFactory, false, resolver);
-    expect(capturedOnMessage).toBeDefined();
+    const onMessage = getOnMessage();
+    expect(onMessage).toBeDefined();
 
-    await capturedOnMessage?.({
+    await sendWebGroupInboundMessage({
+      onMessage: onMessage!,
+      spies,
       body: "hello group",
-      from: "123@g.us",
-      conversationId: "123@g.us",
-      chatId: "123@g.us",
-      chatType: "group",
-      to: "+2",
       id: "g1",
       senderE164: "+111",
       senderName: "Alice",
       selfE164: "+999",
-      sendComposing,
-      reply,
-      sendMedia,
     });
 
     expect(resolver).not.toHaveBeenCalled();
 
-    await capturedOnMessage?.({
+    await sendWebGroupInboundMessage({
+      onMessage: onMessage!,
+      spies,
       body: "@bot ping",
-      from: "123@g.us",
-      conversationId: "123@g.us",
-      chatId: "123@g.us",
-      chatType: "group",
-      to: "+2",
       id: "g2",
       senderE164: "+222",
       senderName: "Bob",
       mentionedJids: ["999@s.whatsapp.net"],
       selfE164: "+999",
       selfJid: "999@s.whatsapp.net",
-      sendComposing,
-      reply,
-      sendMedia,
     });
 
     expect(resolver).toHaveBeenCalledTimes(1);
