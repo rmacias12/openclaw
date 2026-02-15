@@ -1,11 +1,12 @@
 import "./test-helpers.js";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import { monitorWebChannel } from "./auto-reply.js";
+import { monitorWebChannelWithCapture } from "./auto-reply.broadcast-groups.test-harness.js";
 import {
   installWebAutoReplyTestHomeHooks,
   installWebAutoReplyUnitTestHooks,
   resetLoadConfigMock,
+  sendWebDirectInboundMessage,
   setLoadConfigMock,
 } from "./auto-reply.test-harness.js";
 
@@ -26,40 +27,21 @@ describe("broadcast groups", () => {
       },
     } satisfies OpenClawConfig);
 
-    const sendMedia = vi.fn();
-    const reply = vi.fn().mockResolvedValue(undefined);
-    const sendComposing = vi.fn();
     const seen: string[] = [];
     const resolver = vi.fn(async (ctx: { SessionKey?: unknown }) => {
       seen.push(String(ctx.SessionKey));
       return { text: "ok" };
     });
 
-    let capturedOnMessage:
-      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
-      | undefined;
-    const listenerFactory = async (opts: {
-      onMessage: (msg: import("./inbound.js").WebInboundMessage) => Promise<void>;
-    }) => {
-      capturedOnMessage = opts.onMessage;
-      return { close: vi.fn() };
-    };
+    const { spies, onMessage } = await monitorWebChannelWithCapture(resolver);
 
-    await monitorWebChannel(false, listenerFactory, false, resolver);
-    expect(capturedOnMessage).toBeDefined();
-
-    await capturedOnMessage?.({
+    await sendWebDirectInboundMessage({
+      onMessage,
+      spies,
       id: "m1",
       from: "+1000",
-      conversationId: "+1000",
       to: "+2000",
       body: "hello",
-      timestamp: Date.now(),
-      chatType: "direct",
-      chatId: "direct:+1000",
-      sendComposing,
-      reply,
-      sendMedia,
     });
 
     expect(resolver).toHaveBeenCalledTimes(1);

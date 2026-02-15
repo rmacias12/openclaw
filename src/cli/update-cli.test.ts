@@ -144,7 +144,7 @@ describe("update-cli", () => {
 
   const createCaseDir = async (prefix: string) => {
     const dir = path.join(fixtureRoot, `${prefix}-${fixtureCount++}`);
-    await fs.mkdir(dir, { recursive: true });
+    // Tests only need a stable path; the directory does not have to exist because all I/O is mocked.
     return dir;
   };
 
@@ -174,6 +174,39 @@ describe("update-cli", () => {
       value,
       configurable: true,
     });
+  };
+
+  const setupNonInteractiveDowngrade = async () => {
+    const tempDir = await createCaseDir("openclaw-update");
+    setTty(false);
+    readPackageVersion.mockResolvedValue("2.0.0");
+
+    vi.mocked(resolveOpenClawPackageRoot).mockResolvedValue(tempDir);
+    vi.mocked(checkUpdateStatus).mockResolvedValue({
+      root: tempDir,
+      installKind: "package",
+      packageManager: "npm",
+      deps: {
+        manager: "npm",
+        status: "ok",
+        lockfilePath: null,
+        markerPath: null,
+      },
+    });
+    vi.mocked(resolveNpmChannelTag).mockResolvedValue({
+      tag: "latest",
+      version: "0.0.1",
+    });
+    vi.mocked(runGatewayUpdate).mockResolvedValue({
+      status: "ok",
+      mode: "npm",
+      steps: [],
+      durationMs: 100,
+    });
+    vi.mocked(defaultRuntime.error).mockClear();
+    vi.mocked(defaultRuntime.exit).mockClear();
+
+    return tempDir;
   };
 
   beforeEach(() => {
@@ -528,34 +561,7 @@ describe("update-cli", () => {
   });
 
   it("requires confirmation on downgrade when non-interactive", async () => {
-    const tempDir = await createCaseDir("openclaw-update");
-    setTty(false);
-    readPackageVersion.mockResolvedValue("2.0.0");
-
-    vi.mocked(resolveOpenClawPackageRoot).mockResolvedValue(tempDir);
-    vi.mocked(checkUpdateStatus).mockResolvedValue({
-      root: tempDir,
-      installKind: "package",
-      packageManager: "npm",
-      deps: {
-        manager: "npm",
-        status: "ok",
-        lockfilePath: null,
-        markerPath: null,
-      },
-    });
-    vi.mocked(resolveNpmChannelTag).mockResolvedValue({
-      tag: "latest",
-      version: "0.0.1",
-    });
-    vi.mocked(runGatewayUpdate).mockResolvedValue({
-      status: "ok",
-      mode: "npm",
-      steps: [],
-      durationMs: 100,
-    });
-    vi.mocked(defaultRuntime.error).mockClear();
-    vi.mocked(defaultRuntime.exit).mockClear();
+    await setupNonInteractiveDowngrade();
 
     await updateCommand({});
 
@@ -566,34 +572,7 @@ describe("update-cli", () => {
   });
 
   it("allows downgrade with --yes in non-interactive mode", async () => {
-    const tempDir = await createCaseDir("openclaw-update");
-    setTty(false);
-    readPackageVersion.mockResolvedValue("2.0.0");
-
-    vi.mocked(resolveOpenClawPackageRoot).mockResolvedValue(tempDir);
-    vi.mocked(checkUpdateStatus).mockResolvedValue({
-      root: tempDir,
-      installKind: "package",
-      packageManager: "npm",
-      deps: {
-        manager: "npm",
-        status: "ok",
-        lockfilePath: null,
-        markerPath: null,
-      },
-    });
-    vi.mocked(resolveNpmChannelTag).mockResolvedValue({
-      tag: "latest",
-      version: "0.0.1",
-    });
-    vi.mocked(runGatewayUpdate).mockResolvedValue({
-      status: "ok",
-      mode: "npm",
-      steps: [],
-      durationMs: 100,
-    });
-    vi.mocked(defaultRuntime.error).mockClear();
-    vi.mocked(defaultRuntime.exit).mockClear();
+    await setupNonInteractiveDowngrade();
 
     await updateCommand({ yes: true });
 

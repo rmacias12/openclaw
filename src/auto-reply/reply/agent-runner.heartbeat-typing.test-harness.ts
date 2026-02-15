@@ -1,4 +1,4 @@
-import { beforeEach, type MockInstance, vi } from "vitest";
+import { beforeAll, beforeEach, vi } from "vitest";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
 import type { TemplateContext } from "../templating.js";
@@ -6,48 +6,54 @@ import type { GetReplyOptions } from "../types.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
 import { createMockTypingController } from "./test-helpers.js";
 
+// Avoid exporting vitest mock types (TS2742 under pnpm + d.ts emit).
+// oxlint-disable-next-line typescript/no-explicit-any
+type AnyMock = any;
+
 const state = vi.hoisted(() => ({
   runEmbeddedPiAgentMock: vi.fn(),
 }));
 
-export function getRunEmbeddedPiAgentMock(): MockInstance {
+let runReplyAgentPromise:
+  | Promise<(typeof import("./agent-runner.js"))["runReplyAgent"]>
+  | undefined;
+
+async function getRunReplyAgent() {
+  if (!runReplyAgentPromise) {
+    runReplyAgentPromise = import("./agent-runner.js").then((m) => m.runReplyAgent);
+  }
+  return await runReplyAgentPromise;
+}
+
+export function getRunEmbeddedPiAgentMock(): AnyMock {
   return state.runEmbeddedPiAgentMock;
 }
 
 export function installRunReplyAgentTypingHeartbeatTestHooks() {
+  beforeAll(async () => {
+    // Avoid attributing the initial agent-runner import cost to the first test case.
+    await getRunReplyAgent();
+  });
   beforeEach(() => {
     state.runEmbeddedPiAgentMock.mockReset();
   });
 }
 
-vi.mock("../../agents/model-fallback.js", () => ({
-  runWithModelFallback: async ({
-    provider,
-    model,
-    run,
-  }: {
-    provider: string;
-    model: string;
-    run: (provider: string, model: string) => Promise<unknown>;
-  }) => ({
-    result: await run(provider, model),
-    provider,
-    model,
-  }),
-}));
+async function loadHarnessMocks() {
+  const { loadAgentRunnerHarnessMockBundle } = await import("./agent-runner.test-harness.mocks.js");
+  return await loadAgentRunnerHarnessMockBundle(state);
+}
 
-vi.mock("../../agents/pi-embedded.js", () => ({
-  queueEmbeddedPiMessage: vi.fn().mockReturnValue(false),
-  runEmbeddedPiAgent: (params: unknown) => state.runEmbeddedPiAgentMock(params),
-}));
+vi.mock("../../agents/model-fallback.js", async () => {
+  return (await loadHarnessMocks()).modelFallback;
+});
+
+vi.mock("../../agents/pi-embedded.js", async () => {
+  return (await loadHarnessMocks()).embeddedPi;
+});
 
 vi.mock("./queue.js", async () => {
-  const actual = await vi.importActual<typeof import("./queue.js")>("./queue.js");
-  return {
-    ...actual,
-    enqueueFollowupRun: vi.fn(),
-    scheduleFollowupDrain: vi.fn(),
-  };
+  return (await loadHarnessMocks()).queue;
 });
 
 export function createMinimalRun(params?: {
@@ -99,7 +105,7 @@ export function createMinimalRun(params?: {
     typing,
     opts,
     run: async () => {
-      const { runReplyAgent } = await import("./agent-runner.js");
+      const runReplyAgent = await getRunReplyAgent();
       return runReplyAgent({
         commandBody: "hello",
         followupRun,
